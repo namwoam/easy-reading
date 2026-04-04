@@ -1,3 +1,5 @@
+import numeric from 'numeric';
+
 export default defineContentScript({
   matches: ['https://play.google.com/*', 'https://books.googleusercontent.com/*'],
   allFrames: true,
@@ -23,7 +25,7 @@ type WebGazerLike = {
   setGazeListener: (
     listener: (data: WebGazerPoint | null, elapsedTime: number) => void,
   ) => WebGazerLike;
-  begin: () => Promise<WebGazerLike>;
+  begin: (onNoStream?: () => void) => Promise<WebGazerLike>;
   addMouseEventListeners: () => WebGazerLike;
   recordScreenPosition: (x: number, y: number, eventType?: string) => WebGazerLike;
   applyKalmanFilter: (enabled: boolean) => WebGazerLike;
@@ -35,6 +37,7 @@ type WebGazerLike = {
   showFaceOverlay: (show: boolean) => WebGazerLike;
   showFaceFeedbackBox: (show: boolean) => WebGazerLike;
   setRegression: (name: string) => WebGazerLike;
+  getTracker?: () => { name?: string };
   getCurrentPrediction?: () => Promise<WebGazerPoint | null> | WebGazerPoint | null;
   clearData?: () => Promise<void>;
 };
@@ -70,6 +73,42 @@ let calibrationClicks = 0;
 let predictionProbeTimer: number | null = null;
 let calibrationCompletedAt = 0;
 let assistModeActive = false;
+let webGazerCrashGuardInstalled = false;
+
+function installWebGazerCrashGuard() {
+  if (webGazerCrashGuardInstalled) {
+    return;
+  }
+  webGazerCrashGuardInstalled = true;
+
+  window.addEventListener('unhandledrejection', (event) => {
+    const reason = String(event.reason ?? '');
+    if (!reason.includes('forwardFunc is not a function')) {
+      return;
+    }
+
+    event.preventDefault();
+    activeWebGazer = null;
+    disableAssistMode();
+    updateDebugHud(
+      'WebGazer model failed (forwardFunc).\nUsing mouse fallback only in this session.',
+    );
+  });
+
+  window.addEventListener('error', (event) => {
+    const message = String(event.error ?? event.message ?? '');
+    if (!message.includes('forwardFunc is not a function')) {
+      return;
+    }
+
+    event.preventDefault();
+    activeWebGazer = null;
+    disableAssistMode();
+    updateDebugHud(
+      'WebGazer model failed (forwardFunc).\nUsing mouse fallback only in this session.',
+    );
+  });
+}
 
 async function resetCalibration(clearModelData = false) {
   calibrationClicks = 0;
@@ -88,6 +127,7 @@ async function resetCalibration(clearModelData = false) {
 
 async function startGazeHighlighter() {
   console.log('[WebGazer] content script started');
+  installWebGazerCrashGuard();
   installStyle();
   updateDebugHud('Starting WebGazer...');
   collectSentences();
@@ -466,19 +506,42 @@ function updateDebugCursor(x: number, y: number, source: 'gaze' | 'mouse') {
 
 async function initWebGazer(): Promise<WebGazerLike | null> {
   try {
-    // WebGazer's numeric dependency creates functions with `eval` that resolve
-    // `numeric` from global scope, so we expose it before loading WebGazer.
-    const numericModule = await import('numeric');
-    const numericGlobal = (numericModule.default ?? numericModule) as unknown;
-    (globalThis as Record<string, unknown>).numeric = numericGlobal;
+    // WebGazer's numeric dependency resolves `numeric` from global scope.
+    const globals = globalThis as Record<string, unknown>;
+    globals.numeric = numeric as unknown;
+
+    // Ensure FaceMesh constructor is available on global scope before WebGazer initializes.
+    // WebGazer expects this symbol in some runtime/bundler combinations.
+    try {
+      const faceMeshModule = (await import('@mediapipe/face_mesh')) as Record<string, unknown>;
+      const faceMeshModuleDefault = (faceMeshModule.default ??
+        faceMeshModule['module.exports'] ??
+        faceMeshModule) as Record<string, unknown>;
+      const faceMeshCtor =
+        (faceMeshModule.FaceMesh as unknown) ??
+        (faceMeshModuleDefault.FaceMesh as unknown) ??
+        (globals.FaceMesh as unknown);
+
+      if (faceMeshCtor) {
+        globals.FaceMesh = faceMeshCtor;
+      }
+    } catch {
+      // Ignore preload errors; WebGazer init below reports the real failure reason.
+    }
 
     const module = await import('webgazer');
     const maybeWebGazer = (module.default ?? module) as WebGazerLike;
 
-    maybeWebGazer
-      .saveDataAcrossSessions(false)
-      .applyKalmanFilter(true)
-      .setTracker('TFFacemesh');
+    maybeWebGazer.saveDataAcrossSessions(false).applyKalmanFilter(true);
+
+    const trackerCandidates = ['TFFacemesh', 'TFFaceMesh'];
+    for (const candidate of trackerCandidates) {
+      maybeWebGazer.setTracker(candidate);
+      const selectedTracker = maybeWebGazer.getTracker?.()?.name ?? '';
+      if (selectedTracker.toLowerCase().includes('facemesh')) {
+        break;
+      }
+    }
 
     const instance = await maybeWebGazer
       .setRegression('ridge')
@@ -486,7 +549,11 @@ async function initWebGazer(): Promise<WebGazerLike | null> {
       .showPredictionPoints(false)
       .showFaceOverlay(false)
       .showFaceFeedbackBox(false)
-      .begin();
+      .begin(() => {
+        updateDebugHud(
+          'Camera stream unavailable.\nAllow camera access for play.google.com then reload.',
+        );
+      });
 
     instance.addMouseEventListeners();
 
@@ -494,6 +561,15 @@ async function initWebGazer(): Promise<WebGazerLike | null> {
 
     return instance;
   } catch (error) {
+    const message = String(error ?? '');
+    if (
+      message.includes('forwardFunc is not a function') ||
+      message.includes('is not a constructor')
+    ) {
+      console.info('[WebGazer] unavailable in this runtime, using mouse fallback only');
+      return null;
+    }
+
     console.warn('WebGazer failed to initialize:', error);
     return null;
   }

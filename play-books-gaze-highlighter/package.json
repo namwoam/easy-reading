@@ -23,7 +23,7 @@
     "wxt": "^0.20.20"
   },
   "dependencies": {
-    "@mediapipe/face_mesh": "^0.4.1633559619",
-    "webgazer": "^2.1.2"
+    "numeric": "^1.2.6",
+    "webgazer": "^3.5.3"
   }
 }
