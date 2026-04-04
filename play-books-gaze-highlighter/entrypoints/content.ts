@@ -54,6 +54,7 @@ const DEBUG_CURSOR_HIDE_MS = 250;
 const REQUIRED_CALIBRATION_CLICKS = 12;
 const PREDICTION_PROBE_MS = 300;
 const CALIBRATION_TO_ASSIST_MS = 5000;
+const CALIBRATION_HINT_COOLDOWN_MS = 1000;
 const SENTENCE_PATTERN = /[^.!?\n]+[.!?]+(?:\s+|$)|[^.!?\n]+$/g;
 const SHOW_DEBUG_UI = window.top === window.self;
 const CALIBRATION_MSG_TYPE = '__play_books_gaze_calibration_click__';
@@ -74,6 +75,24 @@ let predictionProbeTimer: number | null = null;
 let calibrationCompletedAt = 0;
 let assistModeActive = false;
 let webGazerCrashGuardInstalled = false;
+let lastCalibrationHintAt = 0;
+
+function isCalibrationComplete() {
+  return calibrationClicks >= REQUIRED_CALIBRATION_CLICKS;
+}
+
+function maybeShowCalibrationRequiredHint() {
+  const now = Date.now();
+  if (now - lastCalibrationHintAt < CALIBRATION_HINT_COOLDOWN_MS) {
+    return;
+  }
+
+  lastCalibrationHintAt = now;
+  const remaining = Math.max(0, REQUIRED_CALIBRATION_CLICKS - calibrationClicks);
+  updateDebugHud(
+    `Calibration required before gaze tracking\nClicks left: ${remaining}\n(Press Shift+R to reset anytime)`,
+  );
+}
 
 function installWebGazerCrashGuard() {
   if (webGazerCrashGuardInstalled) {
@@ -114,6 +133,7 @@ async function resetCalibration(clearModelData = false) {
   calibrationClicks = 0;
   calibrationCompletedAt = 0;
   lastPredictionAt = 0;
+  lastCalibrationHintAt = 0;
   disableAssistMode();
 
   if (clearModelData && activeWebGazer?.clearData) {
@@ -121,7 +141,7 @@ async function resetCalibration(clearModelData = false) {
   }
 
   updateDebugHud(
-    `Calibration reset\nClick ${REQUIRED_CALIBRATION_CLICKS} points across the page.\n(Press Shift+R to reset anytime)`,
+    `Calibration reset\nCalibration is required: click ${REQUIRED_CALIBRATION_CLICKS} points across the page.\n(Press Shift+R to reset anytime)`,
   );
 }
 
@@ -163,7 +183,7 @@ async function startGazeHighlighter() {
 
     activeWebGazer.recordScreenPosition(x, y, 'click');
 
-    if (calibrationClicks >= REQUIRED_CALIBRATION_CLICKS) {
+    if (calibrationClicks === REQUIRED_CALIBRATION_CLICKS) {
       calibrationCompletedAt = Date.now();
       updateDebugHud(
         `${progressLine}\nCalibration clicks complete.\nWaiting for first gaze prediction...`,
@@ -304,6 +324,12 @@ async function startGazeHighlighter() {
       if (!prediction) {
         return;
       }
+
+      if (!isCalibrationComplete()) {
+        maybeShowCalibrationRequiredHint();
+        return;
+      }
+
       lastPredictionAt = Date.now();
       disableAssistMode();
       processPoint(prediction, 'gaze');
@@ -326,6 +352,11 @@ async function startGazeHighlighter() {
           'No gaze prediction yet.\nAllow camera and click around the reading area to calibrate.',
         );
       }
+      return;
+    }
+
+    if (!isCalibrationComplete()) {
+      maybeShowCalibrationRequiredHint();
       return;
     }
 
